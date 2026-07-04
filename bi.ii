@@ -1,0 +1,46 @@
+#include "nova_build_info.h"
+
+const char* nova_build_info(void) {
+    return 
+        "NOVA AI v1.0.0\n"
+        "Copyright (c) NOVA AI. All rights reserved.\n"
+        "\n"
+        "Build Info:\n"
+        "  Built: " __DATE__ " " __TIME__ "\n"
+        #ifdef __GNUC__
+        "  Compiler: GCC " __VERSION__ "\n"
+        #endif
+        #ifdef __clang__
+        "  Compiler: Clang " __clang_version__ "\n"
+        #endif
+        #ifdef _MSC_VER
+        "  Compiler: MSVC " _MSC_VER "\n"
+        #endif
+        "\n"
+        "Features:\n"
+        "  AVX512: " 
+        #ifdef __AVX512F__
+        "enabled\n"
+        #else
+        "disabled\n"
+        #endif
+        "  CUDA: "
+        #ifdef NOVA_CUDA
+        "enabled\n"
+        #else
+        "disabled\n"
+        #endif
+        "  ROCM: "
+        #ifdef NOVA_ROCM
+        "enabled\n"
+        #else
+        "disabled\n"
+        #endif
+        "  OPENCL: "
+        #ifdef NOVA_OPENCL
+        "enabled\n"
+        #else
+        "disabled\n"
+        #endif
+        ;
+}
