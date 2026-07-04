@@ -1,0 +1,84 @@
+// training/nova_loss.cpp
+#include "nova_loss.h"
+#include <cmath>
+#include <algorithm>
+
+namespace nova {
+
+CrossEntropyLoss::CrossEntropyLoss()
+    : loss_(0.0f), label_smoothing_(0.0f), ignore_index_(-100.0f),
+      batch_size_(0), vocab_size_(0) {}
+
+CrossEntropyLoss::CrossEntropyLoss(float label_smoothing, float ignore_index)
+    : loss_(0.0f), label_smoothing_(label_smoothing), ignore_index_(ignore_index),
+      batch_size_(0), vocab_size_(0) {}
+
+CrossEntropyLoss::~CrossEntropyLoss() {}
+
+void CrossEntropyLoss::softmax(const std::vector<float>& logits, std::vector<float>& probs) {
+    float max_val = logits[0];
+    for (float v : logits) {
+        if (v > max_val) max_val = v;
+    }
+
+    float sum = 0.0f;
+    for (size_t i = 0; i < logits.size(); i++) {
+        probs[i] = expf(logits[i] - max_val);
+        sum += probs[i];
+    }
+
+    for (size_t i = 0; i < logits.size(); i++) {
+        probs[i] /= sum;
+    }
+}
+
+float CrossEntropyLoss::compute(const std::vector<float>& predictions, const std::vector<float>& targets) {
+    batch_size_ = targets.size();
+    vocab_size_ = predictions.size() / batch_size_;
+
+    loss_ = 0.0f;
+    grad_.resize(predictions.size());
+
+    for (size_t i = 0; i < batch_size_; i++) {
+        size_t start = i * vocab_size_;
+        std::vector<float> logits(vocab_size_);
+        for (size_t j = 0; j < vocab_size_; j++) {
+            logits[j] = predictions[start + j];
+        }
+
+        std::vector<float> probs(vocab_size_);
+        softmax(logits, probs);
+
+        int target = static_cast<int>(targets[i]);
+        if (target == ignore_index_) continue;
+
+        if (label_smoothing_ > 0.0f) {
+            float smooth = label_smoothing_ / vocab_size_;
+            for (size_t j = 0; j < vocab_size_; j++) {
+                float p = (j == static_cast<size_t>(target)) ? 1.0f : 0.0f;
+                probs[j] = (1.0f - label_smoothing_) * p + smooth;
+            }
+        }
+
+        loss_ += -logf(probs[target] + 1e-7f);
+
+        // Gradient
+        for (size_t j = 0; j < vocab_size_; j++) {
+            grad_[start + j] = probs[j] - (j == static_cast<size_t>(target) ? 1.0f : 0.0f);
+        }
+    }
+
+    loss_ /= batch_size_;
+    return loss_;
+}
+
+std::vector<float> CrossEntropyLoss::gradient() {
+    return grad_;
+}
+
+void CrossEntropyLoss::reset() {
+    grad_.clear();
+    loss_ = 0.0f;
+}
+
+} // namespace nova

@@ -1,0 +1,280 @@
+// serving/nova_server_http.cpp
+#include "http.h"
+#include "nlohmann/json.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sstream>
+#include <chrono>
+
+using json = nlohmann::json;
+
+namespace nova {
+
+HTTPServer::HTTPServer() : port_(8080), workers_(4), running_(false) {}
+
+HTTPServer::~HTTPServer() {
+    stop();
+}
+
+void HTTPServer::init(int port, int workers) {
+    port_ = port;
+    workers_ = workers;
+}
+
+void HTTPServer::start() {
+    running_ = true;
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port_);
+
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        close(server_fd);
+        return;
+    }
+
+    if (listen(server_fd, 100) < 0) {
+        close(server_fd);
+        return;
+    }
+
+    for (int i = 0; i < workers_; i++) {
+        worker_threads_.emplace_back(&HTTPServer::worker_loop, this, i);
+    }
+}
+
+void HTTPServer::stop() {
+    running_ = false;
+    for (auto& thread : worker_threads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    worker_threads_.clear();
+}
+
+void HTTPServer::worker_loop(int worker_id) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port_);
+
+    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
+    listen(server_fd, 100);
+
+    while (running_) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
+
+        if (client_fd < 0) continue;
+
+        handle_client(client_fd);
+        close(client_fd);
+    }
+
+    close(server_fd);
+}
+
+void HTTPServer::handle_client(int client_fd) {
+    char buffer[65536];
+    ssize_t bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+
+    if (bytes <= 0) return;
+
+    buffer[bytes] = '\0';
+    std::string request(buffer);
+
+    std::string response = handle_request(request);
+    send(client_fd, response.c_str(), response.length(), 0);
+}
+
+std::string HTTPServer::handle_request(const std::string& request) {
+    std::string method, path, version;
+    std::istringstream iss(request);
+    iss >> method >> path >> version;
+
+    if (method == "GET" && path == "/health") {
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}\n";
+    }
+
+    if (method == "POST" && path == "/v1/completions") {
+        std::string body = parse_request(request);
+        auto req = parse_completion_request(body);
+        auto resp = handle_completion(req);
+        return serialize_response(resp);
+    }
+
+    if (method == "POST" && path == "/v1/chat/completions") {
+        std::string body = parse_request(request);
+        auto req = parse_chat_request(body);
+        auto resp = handle_chat(req);
+        return serialize_response(resp);
+    }
+
+    if (method == "GET" && path == "/v1/models") {
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"data\":[{\"id\":\"nova-7b\",\"object\":\"model\"}]}\n";
+    }
+
+    return "HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not found\"}\n";
+}
+
+std::string HTTPServer::parse_request(const std::string& raw) {
+    size_t body_start = raw.find("\r\n\r\n");
+    if (body_start == std::string::npos) return "";
+    return raw.substr(body_start + 4);
+}
+
+CompletionRequest HTTPServer::parse_completion_request(const std::string& body) {
+    CompletionRequest req;
+
+    try {
+        json data = json::parse(body);
+
+        if (data.contains("model")) req.model = data["model"];
+        if (data.contains("prompt")) req.prompt = data["prompt"];
+        if (data.contains("max_tokens")) req.max_tokens = data["max_tokens"];
+        if (data.contains("temperature")) req.temperature = data["temperature"];
+        if (data.contains("top_p")) req.top_p = data["top_p"];
+        if (data.contains("top_k")) req.top_k = data["top_k"];
+        if (data.contains("stream")) req.stream = data["stream"];
+        if (data.contains("repetition_penalty")) req.repetition_penalty = data["repetition_penalty"];
+        if (data.contains("seed")) req.seed = data["seed"];
+        if (data.contains("echo")) req.echo = data["echo"];
+        if (data.contains("stop")) req.stop = data["stop"].get<std::vector<std::string>>();
+        if (data.contains("presence_penalty")) req.presence_penalty = data["presence_penalty"];
+        if (data.contains("frequency_penalty")) req.frequency_penalty = data["frequency_penalty"];
+    } catch (...) {}
+
+    return req;
+}
+
+ChatRequest HTTPServer::parse_chat_request(const std::string& body) {
+    ChatRequest req;
+
+    try {
+        json data = json::parse(body);
+
+        if (data.contains("model")) req.model = data["model"];
+        if (data.contains("messages")) {
+            req.messages = data["messages"].get<std::vector<std::map<std::string, std::string>>>();
+        }
+        if (data.contains("max_tokens")) req.max_tokens = data["max_tokens"];
+        if (data.contains("temperature")) req.temperature = data["temperature"];
+        if (data.contains("top_p")) req.top_p = data["top_p"];
+        if (data.contains("top_k")) req.top_k = data["top_k"];
+        if (data.contains("stream")) req.stream = data["stream"];
+        if (data.contains("stop")) req.stop = data["stop"].get<std::vector<std::string>>();
+        if (data.contains("presence_penalty")) req.presence_penalty = data["presence_penalty"];
+        if (data.contains("frequency_penalty")) req.frequency_penalty = data["frequency_penalty"];
+        if (data.contains("tool_choice")) req.tool_choice = data["tool_choice"];
+    } catch (...) {}
+
+    return req;
+}
+
+CompletionResponse HTTPServer::handle_completion(const CompletionRequest& req) {
+    if (completion_handler_) {
+        return completion_handler_(req);
+    }
+
+    // Default response
+    CompletionResponse resp;
+    resp.id = "nova-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    resp.object = "text_completion";
+    resp.created = std::time(nullptr);
+    resp.model = req.model.empty() ? "nova-7b" : req.model;
+
+    json choice;
+    choice["text"] = "Hello from NOVA AI!";
+    choice["index"] = 0;
+    choice["finish_reason"] = "stop";
+    resp.choices.push_back(choice);
+
+    resp.usage["prompt_tokens"] = req.prompt.length();
+    resp.usage["completion_tokens"] = 20;
+    resp.usage["total_tokens"] = req.prompt.length() + 20;
+
+    return resp;
+}
+
+CompletionResponse HTTPServer::handle_chat(const ChatRequest& req) {
+    if (chat_handler_) {
+        return chat_handler_(req);
+    }
+
+    CompletionResponse resp;
+    resp.id = "nova-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    resp.object = "chat.completion";
+    resp.created = std::time(nullptr);
+    resp.model = req.model.empty() ? "nova-7b" : req.model;
+
+    json choice;
+    json message;
+    message["role"] = "assistant";
+    message["content"] = "Hello from NOVA AI! How can I help you?";
+    choice["message"] = message;
+    choice["index"] = 0;
+    choice["finish_reason"] = "stop";
+    resp.choices.push_back(choice);
+
+    resp.usage["prompt_tokens"] = 10;
+    resp.usage["completion_tokens"] = 10;
+    resp.usage["total_tokens"] = 20;
+
+    return resp;
+}
+
+std::string HTTPServer::serialize_response(const CompletionResponse& resp) {
+    json data;
+
+    data["id"] = resp.id;
+    data["object"] = resp.object;
+    data["created"] = resp.created;
+    data["model"] = resp.model;
+
+    json choices = json::array();
+    for (const auto& choice : resp.choices) {
+        json c = choice;
+        choices.push_back(c);
+    }
+    data["choices"] = choices;
+
+    json usage;
+    for (const auto& [key, value] : resp.usage) {
+        usage[key] = value;
+    }
+    data["usage"] = usage;
+
+    std::string body = data.dump();
+    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+           std::to_string(body.length()) + "\r\n\r\n" + body + "\n";
+}
+
+void HTTPServer::set_completion_handler(std::function<CompletionResponse(const CompletionRequest&)> handler) {
+    completion_handler_ = handler;
+}
+
+void HTTPServer::set_chat_handler(std::function<CompletionResponse(const ChatRequest&)> handler) {
+    chat_handler_ = handler;
+}
+
+} // namespace nova

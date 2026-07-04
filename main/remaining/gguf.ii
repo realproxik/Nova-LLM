@@ -1,0 +1,185 @@
+// gguf.cpp
+#include "gguf.h"
+#include <cstring>
+#include <algorithm>
+
+namespace nova {
+
+GGUFLoader::GGUFLoader() : tensor_count_(0), total_size_(0) {}
+
+GGUFLoader::~GGUFLoader() {
+    if (file_.is_open()) file_.close();
+}
+
+bool GGUFLoader::load(const std::string& path) {
+    path_ = path;
+    file_.open(path, std::ios::binary);
+    if (!file_.is_open()) return false;
+
+    if (!read_magic()) return false;
+    if (!read_version()) return false;
+    if (!read_metadata_kv_count()) return false;
+    if (!read_tensor_info()) return false;
+
+    return true;
+}
+
+bool GGUFLoader::read_magic() {
+    char magic[4];
+    read_data(magic, 4);
+    metadata_.magic = std::string(magic, 4);
+    return metadata_.magic == "GGUF";
+}
+
+bool GGUFLoader::read_version() {
+    metadata_.version = read_value<uint32_t>();
+    return metadata_.version >= 1 && metadata_.version <= 3;
+}
+
+bool GGUFLoader::read_metadata_kv_count() {
+    metadata_.metadata_kv_count = read_value<uint64_t>();
+
+    for (uint64_t i = 0; i < metadata_.metadata_kv_count; i++) {
+        std::string key;
+        read_string(key);
+
+        GGUFValue value;
+        read_metadata_value(value);
+        metadata_.metadata[key] = value;
+    }
+
+    return true;
+}
+
+void GGUFLoader::read_metadata_value(GGUFValue& value) {
+    uint32_t type = read_value<uint32_t>();
+    value.type = static_cast<GGUFValue::Type>(type);
+
+    switch (value.type) {
+        case GGUFValue::UINT8: {
+            uint8_t v = read_value<uint8_t>();
+            value.data.assign(&v, &v + 1);
+            break;
+        }
+        case GGUFValue::INT8: {
+            int8_t v = read_value<int8_t>();
+            value.data.assign(reinterpret_cast<uint8_t*>(&v), reinterpret_cast<uint8_t*>(&v) + 1);
+            break;
+        }
+        case GGUFValue::UINT16: {
+            uint16_t v = read_value<uint16_t>();
+            value.data.resize(2);
+            memcpy(value.data.data(), &v, 2);
+            break;
+        }
+        case GGUFValue::INT16: {
+            int16_t v = read_value<int16_t>();
+            value.data.resize(2);
+            memcpy(value.data.data(), &v, 2);
+            break;
+        }
+        case GGUFValue::UINT32: {
+            uint32_t v = read_value<uint32_t>();
+            value.data.resize(4);
+            memcpy(value.data.data(), &v, 4);
+            break;
+        }
+        case GGUFValue::INT32: {
+            int32_t v = read_value<int32_t>();
+            value.data.resize(4);
+            memcpy(value.data.data(), &v, 4);
+            break;
+        }
+        case GGUFValue::FLOAT32: {
+            float v = read_value<float>();
+            value.data.resize(4);
+            memcpy(value.data.data(), &v, 4);
+            break;
+        }
+        case GGUFValue::BOOL: {
+            bool v = read_value<bool>();
+            value.data.assign(&v, &v + 1);
+            break;
+        }
+        case GGUFValue::STRING: {
+            std::string v;
+            read_string(v);
+            value.data.assign(v.begin(), v.end());
+            break;
+        }
+        case GGUFValue::ARRAY: {
+            uint64_t count = read_value<uint64_t>();
+            uint32_t elem_type = read_value<uint32_t>();
+            for (uint64_t i = 0; i < count; i++) {
+                GGUFValue elem;
+                elem.type = static_cast<GGUFValue::Type>(elem_type);
+                read_metadata_value(elem);
+                value.data.insert(value.data.end(), elem.data.begin(), elem.data.end());
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+bool GGUFLoader::read_tensor_info() {
+    tensor_count_ = read_value<uint64_t>();
+
+    for (uint64_t i = 0; i < tensor_count_; i++) {
+        std::string name;
+        read_string(name);
+
+        uint64_t offset = read_value<uint64_t>();
+        uint64_t size = read_value<uint64_t>();
+        uint32_t type = read_value<uint32_t>();
+
+        metadata_.tensor_names.push_back(name);
+        metadata_.tensor_offsets.push_back(offset);
+        metadata_.tensor_sizes.push_back(size);
+        metadata_.tensor_types.push_back(type);
+
+        tensor_index_[name] = {offset, size};
+        total_size_ += size;
+    }
+
+    return true;
+}
+
+bool GGUFLoader::load_tensor_data(const std::string& name, float* buffer, size_t size) {
+    auto it = tensor_index_.find(name);
+    if (it == tensor_index_.end()) return false;
+
+    auto [offset, tensor_size] = it->second;
+    if (tensor_size > size) return false;
+
+    file_.seekg(offset, std::ios::beg);
+    read_data(buffer, tensor_size);
+
+    return true;
+}
+
+std::string GGUFLoader::get_chat_template() const {
+    auto it = metadata_.metadata.find("tokenizer.chat_template");
+    if (it == metadata_.metadata.end()) return "";
+    return std::string(it->second.data.begin(), it->second.data.end());
+}
+
+template<typename T>
+T GGUFLoader::read_value() {
+    T value;
+    read_data(&value, sizeof(T));
+    return value;
+}
+
+void GGUFLoader::read_data(void* buffer, size_t size) {
+    file_.read(static_cast<char*>(buffer), size);
+}
+
+void GGUFLoader::read_string(std::string& str) {
+    uint64_t len = read_value<uint64_t>();
+    str.resize(len);
+    read_data(&str[0], len);
+}
+
+} // namespace nova

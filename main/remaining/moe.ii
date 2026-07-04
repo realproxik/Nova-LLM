@@ -1,0 +1,198 @@
+// core/nova_moe.cpp
+#include "moe.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <random>
+
+namespace nova {
+
+MoE::MoE()
+    : num_experts_(0), top_k_(0), hidden_size_(0), intermediate_size_(0) {}
+
+MoE::~MoE() {
+    clear();
+}
+
+void MoE::init(size_t num_experts, size_t top_k, size_t hidden_size, size_t intermediate_size) {
+    num_experts_ = num_experts;
+    top_k_ = top_k;
+    hidden_size_ = hidden_size;
+    intermediate_size_ = intermediate_size;
+
+    experts_.resize(num_experts);
+    for (size_t i = 0; i < num_experts; i++) {
+        experts_[i].w1.resize(hidden_size * intermediate_size);
+        experts_[i].w2.resize(intermediate_size * hidden_size);
+        experts_[i].w3.resize(hidden_size * intermediate_size);
+        experts_[i].buffer.resize(intermediate_size);
+        experts_[i].used_count = 0;
+        experts_[i].total_weight = 0.0f;
+    }
+
+    router_weights_.resize(hidden_size * num_experts);
+    router_scores_.resize(num_experts);
+    expert_indices_.resize(top_k);
+    expert_weights_.resize(top_k);
+    expert_counts_.resize(num_experts);
+
+    // Initialize weights
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::normal_distribution<float> dist(0.0f, 0.02f);
+
+    for (auto& w : router_weights_) {
+        w = dist(gen);
+    }
+
+    for (auto& expert : experts_) {
+        for (auto& w : expert.w1) w = dist(gen);
+        for (auto& w : expert.w2) w = dist(gen);
+        for (auto& w : expert.w3) w = dist(gen);
+    }
+}
+
+void MoE::clear() {
+    experts_.clear();
+    router_weights_.clear();
+    router_scores_.clear();
+    expert_indices_.clear();
+    expert_weights_.clear();
+    expert_counts_.clear();
+}
+
+void MoE::set_expert_weights(size_t expert_id, const float* w1, const float* w2, size_t size) {
+    if (expert_id >= num_experts_) return;
+
+    size_t w1_size = hidden_size_ * intermediate_size_;
+    size_t w2_size = intermediate_size_ * hidden_size_;
+
+    if (size >= w1_size) {
+        memcpy(experts_[expert_id].w1.data(), w1, w1_size * sizeof(float));
+    }
+
+    if (size >= w1_size + w2_size) {
+        memcpy(experts_[expert_id].w2.data(), w2 + w1_size, w2_size * sizeof(float));
+    }
+}
+
+void MoE::set_router_weights(const float* router, size_t size) {
+    size_t router_size = hidden_size_ * num_experts_;
+    if (size >= router_size) {
+        memcpy(router_weights_.data(), router, router_size * sizeof(float));
+    }
+}
+
+void MoE::forward(
+    const float* input,
+    float* output,
+    size_t batch,
+    size_t seq_len,
+    size_t hidden_size
+) {
+    size_t total_tokens = batch * seq_len;
+
+    for (size_t t = 0; t < total_tokens; t++) {
+        const float* in = input + t * hidden_size;
+        float* out = output + t * hidden_size;
+
+        // Reset expert counts
+        std::fill(expert_counts_.begin(), expert_counts_.end(), 0);
+
+        // Compute router scores
+        for (size_t e = 0; e < num_experts_; e++) {
+            router_scores_[e] = 0.0f;
+            for (size_t i = 0; i < hidden_size; i++) {
+                router_scores_[e] += in[i] * router_weights_[e * hidden_size + i];
+            }
+            router_scores_[e] = expf(router_scores_[e]);
+        }
+
+        // Normalize and find top-k
+        float sum = 0.0f;
+        for (size_t e = 0; e < num_experts_; e++) {
+            sum += router_scores_[e];
+        }
+
+        for (size_t e = 0; e < num_experts_; e++) {
+            router_scores_[e] /= sum;
+        }
+
+        // Find top-k experts
+        std::vector<std::pair<float, size_t>> scores;
+        for (size_t e = 0; e < num_experts_; e++) {
+            scores.push_back({router_scores_[e], e});
+        }
+
+        std::sort(scores.begin(), scores.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        for (size_t k = 0; k < top_k_; k++) {
+            expert_indices_[k] = scores[k].second;
+            expert_weights_[k] = scores[k].first;
+            expert_counts_[scores[k].second]++;
+        }
+
+        // Compute expert outputs
+        std::vector<float> expert_output(hidden_size, 0.0f);
+
+        for (size_t k = 0; k < top_k_; k++) {
+            size_t expert_id = expert_indices_[k];
+            float weight = expert_weights_[k];
+
+            std::vector<float> temp_out(hidden_size);
+            forward_expert(in, temp_out.data(), expert_id, 1, 1, hidden_size);
+
+            for (size_t i = 0; i < hidden_size; i++) {
+                expert_output[i] += weight * temp_out[i];
+            }
+        }
+
+        memcpy(out, expert_output.data(), hidden_size * sizeof(float));
+    }
+}
+
+void MoE::forward_expert(
+    const float* input,
+    float* output,
+    size_t expert_id,
+    size_t batch,
+    size_t seq_len,
+    size_t hidden_size
+) {
+    Expert& expert = experts_[expert_id];
+    size_t total_tokens = batch * seq_len;
+
+    for (size_t t = 0; t < total_tokens; t++) {
+        const float* in = input + t * hidden_size;
+        float* out = output + t * hidden_size;
+
+        // W1
+        for (size_t i = 0; i < intermediate_size_; i++) {
+            float sum = 0.0f;
+            for (size_t j = 0; j < hidden_size; j++) {
+                sum += in[j] * expert.w1[i * hidden_size + j];
+            }
+            expert.buffer[i] = swish(sum);
+        }
+
+        // W2
+        for (size_t i = 0; i < hidden_size; i++) {
+            float sum = 0.0f;
+            for (size_t j = 0; j < intermediate_size_; j++) {
+                sum += expert.buffer[j] * expert.w2[i * intermediate_size_ + j];
+            }
+            out[i] = sum;
+        }
+    }
+}
+
+float MoE::gelu(float x) const {
+    return 0.5f * x * (1.0f + erf(x / sqrtf(2.0f)));
+}
+
+float MoE::swish(float x) const {
+    return x / (1.0f + expf(-x));
+}
+
+} // namespace nova

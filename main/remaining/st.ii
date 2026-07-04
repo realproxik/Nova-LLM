@@ -1,0 +1,93 @@
+// core/nova_safetensors.cpp
+#include "nova_safetensors.h"
+#include "nlohmann/json.hpp"
+#include <fstream>
+#include <cstring>
+
+using json = nlohmann::json;
+
+namespace nova {
+
+SafetensorsLoader::SafetensorsLoader() : header_size_(0), data_offset_(0) {}
+
+SafetensorsLoader::~SafetensorsLoader() {
+    if (file_.is_open()) file_.close();
+}
+
+bool SafetensorsLoader::load(const std::string& path) {
+    path_ = path;
+    file_.open(path, std::ios::binary);
+    if (!file_.is_open()) return false;
+
+    return load_header();
+}
+
+bool SafetensorsLoader::load_header() {
+    // Read header size (8 bytes)
+    uint64_t header_len;
+    file_.read(reinterpret_cast<char*>(&header_len), 8);
+
+    // Read header JSON
+    std::vector<char> header_data(header_len);
+    file_.read(header_data.data(), header_len);
+    std::string header_json(header_data.data(), header_len);
+
+    data_offset_ = 8 + header_len;
+
+    return parse_header(header_json);
+}
+
+bool SafetensorsLoader::parse_header(const std::string& header_json) {
+    try {
+        json data = json::parse(header_json);
+
+        if (data.contains("__metadata__")) {
+            // Skip metadata
+        }
+
+        for (auto& [key, value] : data.items()) {
+            if (key == "__metadata__") continue;
+
+            SafetensorInfo info;
+            info.name = key;
+
+            if (value.contains("shape")) {
+                info.shape = value["shape"].get<std::vector<size_t>>();
+            }
+
+            if (value.contains("dtype")) {
+                info.dtype = value["dtype"].get<std::string>();
+            }
+
+            if (value.contains("data_offsets")) {
+                auto offsets = value["data_offsets"].get<std::vector<size_t>>();
+                if (offsets.size() >= 2) {
+                    info.offset = offsets[0];
+                    info.size = offsets[1] - offsets[0];
+                }
+            }
+
+            tensors_[key] = info;
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        return false;
+    }
+}
+
+bool SafetensorsLoader::load_tensor_data(const std::string& name, float* buffer, size_t size) {
+    auto it = tensors_.find(name);
+    if (it == tensors_.end()) return false;
+
+    auto& info = it->second;
+    if (info.size > size) return false;
+
+    file_.seekg(data_offset_ + info.offset, std::ios::beg);
+    file_.read(reinterpret_cast<char*>(buffer), info.size);
+
+    // Convert if needed (simplified)
+    return true;
+}
+
+} // namespace nova

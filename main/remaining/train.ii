@@ -1,0 +1,231 @@
+// training/nova_trainer.cpp
+#include "train.h"
+#include "model.h"
+#include "op.h"
+#include "tll.h"
+#include  "l.h"
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+
+namespace nova {
+
+Trainer::Trainer()
+    : training_(false), early_stop_(false), early_stop_patience_(5.0f),
+      early_stop_min_delta_(0.01f), best_loss_(INFINITY), patience_counter_(0) {}
+
+Trainer::~Trainer() {}
+
+void Trainer::init(const TrainerConfig& config) {
+    config_ = config;
+    metrics_ = TrainingMetrics{};
+    metrics_.global_step = 0;
+    metrics_.epoch = 0;
+    metrics_.learning_rate = config_.learning_rate;
+}
+
+void Trainer::set_model(std::shared_ptr<Model> model) {
+    model_ = model;
+}
+
+void Trainer::set_optimizer(std::shared_ptr<Optimizer> optimizer) {
+    optimizer_ = optimizer;
+}
+
+void Trainer::set_data_loader(std::shared_ptr<DataLoader> data_loader) {
+    data_loader_ = data_loader;
+}
+
+void Trainer::set_loss_function(std::shared_ptr<LossFunction> loss_fn) {
+    loss_fn_ = loss_fn;
+}
+
+void Trainer::train() {
+    if (!model_ || !optimizer_ || !data_loader_ || !loss_fn_) {
+        return;
+    }
+
+    training_ = true;
+    best_loss_ = INFINITY;
+    patience_counter_ = 0;
+
+    while (training_ && metrics_.global_step < config_.max_steps) {
+        // Epoch loop
+        data_loader_->reset();
+
+        while (data_loader_->has_next() && training_) {
+            train_step();
+
+            // Evaluation
+            if (metrics_.global_step % config_.eval_steps == 0) {
+                eval();
+            }
+
+            // Checkpoint
+            if (metrics_.global_step % config_.save_steps == 0 && metrics_.global_step > 0) {
+                std::string path = config_.output_dir + "/checkpoint_" + std::to_string(metrics_.global_step);
+                save_checkpoint(path);
+            }
+
+            // Early stopping
+            if (early_stop_ && metrics_.loss < best_loss_ - early_stop_min_delta_) {
+                best_loss_ = metrics_.loss;
+                patience_counter_ = 0;
+            } else if (early_stop_) {
+                patience_counter_++;
+                if (patience_counter_ >= early_stop_patience_) {
+                    training_ = false;
+                    break;
+                }
+            }
+        }
+
+        metrics_.epoch++;
+    }
+}
+
+void Trainer::train_step() {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Get batch
+    auto batch = data_loader_->next_batch();
+    if (batch.empty()) return;
+
+    // Forward pass
+    forward_backward();
+
+    // Gradient accumulation
+    if (metrics_.global_step % config_.grad_accum_steps == 0) {
+        // Clip gradients
+        apply_grad_clipping();
+
+        // Update weights
+        update_weights();
+        optimizer_->zero_grad();
+    }
+
+    // Update learning rate
+    update_learning_rate();
+
+    // Log metrics
+    if (metrics_.global_step % config_.log_steps == 0) {
+        log_metrics();
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+    metrics_.throughput = config_.batch_size * config_.grad_accum_steps / (duration / 1000.0f);
+    metrics_.global_step++;
+}
+
+void Trainer::forward_backward() {
+    auto batch = data_loader_->current_batch();
+    size_t batch_size = batch.size();
+
+    // Forward pass
+    std::vector<float> predictions = model_->forward(batch.inputs);
+    metrics_.loss = loss_fn_->compute(predictions, batch.targets);
+
+    // Backward pass
+    std::vector<float> grad_inputs = loss_fn_->gradient();
+    model_->backward(grad_inputs);
+
+    // Compute gradient norm
+    compute_grad_norm();
+}
+
+void Trainer::update_weights() {
+    optimizer_->step();
+}
+
+void Trainer::compute_grad_norm() {
+    float total_norm = 0.0f;
+    auto gradients = model_->get_gradients();
+
+    for (const auto& grad : gradients) {
+        for (float g : grad) {
+            total_norm += g * g;
+        }
+    }
+
+    metrics_.grad_norm = sqrtf(total_norm);
+}
+
+void Trainer::apply_grad_clipping() {
+    if (config_.max_grad_norm <= 0) return;
+
+    float scale = config_.max_grad_norm / (metrics_.grad_norm + 1e-7f);
+    if (scale < 1.0f) {
+        auto gradients = model_->get_gradients();
+        for (auto& grad : gradients) {
+            for (float& g : grad) {
+                g *= scale;
+            }
+        }
+    }
+}
+
+void Trainer::update_learning_rate() {
+    float progress = static_cast<float>(metrics_.global_step) / config_.max_steps;
+
+    // Warmup
+    if (progress < config_.warmup_ratio) {
+        metrics_.learning_rate = config_.learning_rate * (progress / config_.warmup_ratio);
+    } else {
+        // Cosine decay
+        float cosine = 0.5f * (1.0f + cosf(3.14159f * (progress - config_.warmup_ratio) / (1.0f - config_.warmup_ratio)));
+        metrics_.learning_rate = config_.learning_rate * cosine;
+    }
+
+    optimizer_->set_learning_rate(metrics_.learning_rate);
+}
+
+void Trainer::eval() {
+    if (!data_loader_) return;
+
+    auto eval_data = data_loader_->get_eval_data();
+    if (eval_data.empty()) return;
+
+    float total_loss = 0.0f;
+    size_t total_samples = 0;
+
+    for (const auto& batch : eval_data) {
+        std::vector<float> predictions = model_->forward(batch.inputs);
+        float loss = loss_fn_->compute(predictions, batch.targets);
+        total_loss += loss * batch.inputs.size();
+        total_samples += batch.inputs.size();
+    }
+
+    float avg_loss = total_loss / total_samples;
+    float perplexity = expf(avg_loss);
+
+    metrics_.perplexity = perplexity;
+
+    if (progress_callback_) {
+        progress_callback_(metrics_);
+    }
+}
+
+void Trainer::log_metrics() {
+    printf("[%zu] Loss: %.4f, LR: %.6f, Grad: %.4f, PPL: %.4f, Throughput: %.2f tokens/s\n",
+           metrics_.global_step,
+           metrics_.loss,
+           metrics_.learning_rate,
+           metrics_.grad_norm,
+           metrics_.perplexity,
+           metrics_.throughput);
+}
+
+void Trainer::save_checkpoint(const std::string& path) {
+    model_->save(path + ".model");
+    optimizer_->save(path + ".opt");
+}
+
+void Trainer::load_checkpoint(const std::string& path) {
+    model_->load(path + ".model");
+    optimizer_->load(path + ".opt");
+}
+
+} // namespace nova

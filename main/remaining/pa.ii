@@ -1,0 +1,138 @@
+// core/nova_paged_attention.cpp
+#include "nova_paged_attention.h"
+#include <algorithm>
+#include <cmath>
+
+namespace nova {
+
+PagedAttention::PagedAttention()
+    : num_heads_(0), head_dim_(0), block_size_(0), max_blocks_(0),
+      next_page_id_(0), next_block_id_(0) {}
+
+PagedAttention::~PagedAttention() {
+    clear();
+}
+
+void PagedAttention::init(size_t num_heads, size_t head_dim, size_t block_size, size_t max_blocks) {
+    num_heads_ = num_heads;
+    head_dim_ = head_dim;
+    block_size_ = block_size;
+    max_blocks_ = max_blocks;
+
+    size_t page_size = get_page_size();
+
+    // Initialize free blocks
+    for (size_t i = 0; i < max_blocks; i++) {
+        PhysicalBlock block;
+        block.id = next_block_id_++;
+        block.k_cache.resize(page_size);
+        block.v_cache.resize(page_size);
+        block.free = true;
+        block.ref_count = 0;
+        physical_blocks_[block.id] = std::move(block);
+        free_list_.push_back(block.id);
+    }
+}
+
+void PagedAttention::clear() {
+    logical_pages_.clear();
+    physical_blocks_.clear();
+    free_list_.clear();
+    next_page_id_ = 0;
+    next_block_id_ = 0;
+}
+
+uint64_t PagedAttention::allocate_page() {
+    if (free_list_.empty()) {
+        defragment();
+        if (free_list_.empty()) {
+            return 0;
+        }
+    }
+
+    uint64_t block_id = free_list_.back();
+    free_list_.pop_back();
+
+    auto it = physical_blocks_.find(block_id);
+    if (it == physical_blocks_.end()) {
+        return 0;
+    }
+
+    it->second.free = false;
+
+    LogicalPage page;
+    page.id = next_page_id_++;
+    page.physical_block = block_id;
+    page.valid = true;
+    page.seq_len = 0;
+
+    logical_pages_[page.id] = page;
+
+    return page.id;
+}
+
+void PagedAttention::free_page(uint64_t page_id) {
+    auto it = logical_pages_.find(page_id);
+    if (it == logical_pages_.end()) return;
+
+    uint64_t block_id = it->second.physical_block;
+    auto bit = physical_blocks_.find(block_id);
+    if (bit != physical_blocks_.end()) {
+        bit->second.free = true;
+        bit->second.ref_count = 0;
+        free_list_.push_back(block_id);
+    }
+
+    logical_pages_.erase(it);
+}
+
+void PagedAttention::set_k(uint64_t logical_page, size_t pos, const float* k, size_t len) {
+    auto it = logical_pages_.find(logical_page);
+    if (it == logical_pages_.end()) return;
+
+    uint64_t block_id = it->second.physical_block;
+    auto bit = physical_blocks_.find(block_id);
+    if (bit == physical_blocks_.end()) return;
+
+    size_t offset = pos * num_heads_ * head_dim_;
+    size_t copy_size = len * num_heads_ * head_dim_ * sizeof(float);
+    memcpy(bit->second.k_cache.data() + offset, k, copy_size);
+
+    it->second.seq_len += len;
+}
+
+const float* PagedAttention::get_k(uint64_t logical_page, size_t pos) const {
+    auto it = logical_pages_.find(logical_page);
+    if (it == logical_pages_.end()) return nullptr;
+
+    uint64_t block_id = it->second.physical_block;
+    auto bit = physical_blocks_.find(block_id);
+    if (bit == physical_blocks_.end()) return nullptr;
+
+    size_t offset = pos * num_heads_ * head_dim_;
+    return bit->second.k_cache.data() + offset;
+}
+
+void PagedAttention::defragment() {
+    // Compaction algorithm - move pages to contiguous blocks
+    std::vector<uint64_t> active_blocks;
+    for (auto& [id, page] : logical_pages_) {
+        active_blocks.push_back(page.physical_block);
+    }
+
+    free_list_.clear();
+    for (auto& [id, block] : physical_blocks_) {
+        if (block.free) {
+            free_list_.push_back(id);
+        }
+    }
+
+    // Sort free blocks
+    std::sort(free_list_.begin(), free_list_.end());
+}
+
+size_t PagedAttention::get_page_size() const {
+    return num_heads_ * head_dim_ * block_size_;
+}
+
+} // namespace nova

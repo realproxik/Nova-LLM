@@ -1,0 +1,132 @@
+// core/nova_kv_cache.cpp
+#include "cache.h"
+#include <algorithm>
+#include <cmath>
+
+namespace nova {
+
+KVCache::KVCache()
+    : num_heads_(0), head_dim_(0), max_seq_(0), max_batch_(0),
+      total_memory_(0), used_memory_(0) {}
+
+KVCache::~KVCache() {
+    clear();
+}
+
+void KVCache::init(size_t num_heads, size_t head_dim, size_t max_seq, size_t max_batch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    num_heads_ = num_heads;
+    head_dim_ = head_dim;
+    max_seq_ = max_seq;
+    max_batch_ = max_batch;
+
+    size_t page_size = get_page_size();
+    total_memory_ = page_size * max_batch * max_seq;
+}
+
+void KVCache::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pages_.clear();
+    used_memory_ = 0;
+}
+
+void KVCache::allocate_block(uint64_t page_id, size_t seq_len) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (pages_.find(page_id) != pages_.end()) {
+        return;
+    }
+
+    CachePage page;
+    page.id = page_id;
+    page.seq_len = seq_len;
+    page.max_seq = max_seq_;
+    page.last_used = 0;
+    page.use_count = 0;
+    page.active = true;
+
+    size_t page_size = get_page_size();
+    page.k_cache.resize(page_size);
+    page.v_cache.resize(page_size);
+
+    pages_[page_id] = std::move(page);
+    used_memory_ += page_size * 2 * sizeof(float);
+}
+
+void KVCache::free_block(uint64_t page_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = pages_.find(page_id);
+    if (it == pages_.end()) return;
+
+    size_t page_size = get_page_size();
+    used_memory_ -= page_size * 2 * sizeof(float);
+    pages_.erase(it);
+}
+
+float* KVCache::get_k(uint64_t page_id, size_t pos) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = pages_.find(page_id);
+    if (it == pages_.end()) return nullptr;
+
+    it->second.last_used = 0;
+    it->second.use_count++;
+
+    return it->second.k_cache.data() + pos * num_heads_ * head_dim_;
+}
+
+float* KVCache::get_v(uint64_t page_id, size_t pos) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = pages_.find(page_id);
+    if (it == pages_.end()) return nullptr;
+
+    it->second.last_used = 0;
+    it->second.use_count++;
+
+    return it->second.v_cache.data() + pos * num_heads_ * head_dim_;
+}
+
+void KVCache::append(uint64_t page_id, const float* k, const float* v, size_t seq_len) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = pages_.find(page_id);
+    if (it == pages_.end()) return;
+
+    size_t page_size = get_page_size();
+    size_t offset = it->second.seq_len * num_heads_ * head_dim_;
+
+    memcpy(it->second.k_cache.data() + offset, k, seq_len * num_heads_ * head_dim_ * sizeof(float));
+    memcpy(it->second.v_cache.data() + offset, v, seq_len * num_heads_ * head_dim_ * sizeof(float));
+
+    it->second.seq_len += seq_len;
+    it->second.last_used = 0;
+}
+
+void KVCache::evict_lru() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (pages_.empty()) return;
+
+    uint64_t oldest = 0;
+    uint64_t oldest_time = UINT64_MAX;
+
+    for (auto& [id, page] : pages_) {
+        if (page.active && page.last_used < oldest_time) {
+            oldest_time = page.last_used;
+            oldest = id;
+        }
+    }
+
+    if (oldest != 0) {
+        free_block(oldest);
+    }
+}
+
+size_t KVCache::get_page_size() const {
+    return num_heads_ * head_dim_ * max_seq_;
+}
+
+} // namespace nova

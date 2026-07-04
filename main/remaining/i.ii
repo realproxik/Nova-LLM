@@ -1,0 +1,231 @@
+// core/nova_inference.cpp
+#include "i.h"
+#include "model.h"
+#include "oken.h"
+#include "cache.h"
+#include "pa.h"
+#include <random>
+#include <cmath>
+#include <chrono>
+#include <cstring>
+
+namespace nova {
+
+InferenceEngine::InferenceEngine() {}
+
+InferenceEngine::~InferenceEngine() {}
+
+void InferenceEngine::init(const InferenceConfig& config) {
+    config_ = config;
+
+    if (config_.use_paged_attention) {
+        paged_attention_ = std::make_unique<PagedAttention>();
+        paged_attention_->init(32, 128, 64, 10000);
+    }
+
+    if (config_.use_cache) {
+        kv_cache_ = std::make_unique<KVCache>();
+        kv_cache_->init(32, 128, config_.max_seq_len, config_.max_batch);
+    }
+}
+
+void InferenceEngine::load_model(std::shared_ptr<Model> model) {
+    model_ = model;
+}
+
+void InferenceEngine::load_tokenizer(std::shared_ptr<Tokenizer> tokenizer) {
+    tokenizer_ = tokenizer;
+}
+
+GenerationResult InferenceEngine::generate(
+    const std::vector<int>& prompt_tokens,
+    int max_new_tokens,
+    float temperature,
+    float top_p,
+    int top_k
+) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    if (max_new_tokens < 0) max_new_tokens = config_.max_new_tokens;
+    if (temperature < 0) temperature = config_.temperature;
+    if (top_p < 0) top_p = config_.top_p;
+    if (top_k < 0) top_k = config_.top_k;
+
+    std::vector<int> tokens = prompt_tokens;
+    std::vector<float> logprobs;
+
+    float total_logprob = 0.0f;
+
+    for (int i = 0; i < max_new_tokens; i++) {
+        // Forward pass
+        std::vector<int> logits = forward_pass(tokens);
+
+        if (logits.empty()) break;
+
+        // Apply repetition penalty
+        if (config_.repetition_penalty != 1.0f) {
+            for (int token : tokens) {
+                if (token < (int)logits.size()) {
+                    logits[token] *= config_.repetition_penalty;
+                }
+            }
+        }
+
+        // Sample next token
+        int next_token;
+        if (config_.do_sample && temperature > 0) {
+            apply_temperature(logits.data(), logits.size(), temperature);
+            apply_top_p(logits.data(), logits.size(), top_p);
+            apply_top_k(logits.data(), logits.size(), top_k);
+            next_token = sample_multinomial(logits.data(), logits.size());
+        } else {
+            next_token = sample_greedy(logits.data(), logits.size());
+        }
+
+        // Compute log probability
+        softmax(logits.data(), logits.size());
+        float prob = logits[next_token] / 1000000.0f; // Simplified
+        total_logprob += logf(prob + 1e-7f);
+
+        tokens.push_back(next_token);
+
+        // Check for EOS
+        if (tokenizer_ && next_token == tokenizer_->eos_id()) {
+            break;
+        }
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+    GenerationResult result;
+    result.tokens = tokens;
+    result.text = postprocess_result(tokens);
+    result.avg_logprob = total_logprob / (tokens.size() - prompt_tokens.size());
+    result.total_time_ms = duration_ms;
+    result.tokens_per_second = static_cast<int>((tokens.size() - prompt_tokens.size()) / (duration_ms / 1000.0f));
+
+    return result;
+}
+
+std::vector<int> InferenceEngine::forward_pass(const std::vector<int>& tokens) {
+    if (!model_) return {};
+
+    std::vector<float> input_embeddings(tokens.size() * model_->hidden_size());
+    // Embedding lookup
+    for (size_t i = 0; i < tokens.size(); i++) {
+        const float* embed = model_->get_embedding(tokens[i]);
+        memcpy(input_embeddings.data() + i * model_->hidden_size(),
+               embed, model_->hidden_size() * sizeof(float));
+    }
+
+    // Run model forward
+    std::vector<float> logits(model_->vocab_size());
+    model_->forward(input_embeddings.data(), logits.data(), 1, tokens.size());
+
+    return std::vector<int>(logits.begin(), logits.end());
+}
+
+void InferenceEngine::apply_temperature(float* logits, int size, float temp) {
+    for (int i = 0; i < size; i++) {
+        logits[i] /= temp;
+    }
+}
+
+void InferenceEngine::apply_top_p(float* logits, int size, float p) {
+    std::vector<std::pair<float, int>> pairs;
+    for (int i = 0; i < size; i++) {
+        pairs.push_back({logits[i], i});
+    }
+
+    std::sort(pairs.begin(), pairs.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    float sum = 0.0f;
+    int cutoff = 0;
+    for (int i = 0; i < size; i++) {
+        sum += pairs[i].first;
+        if (sum >= p) {
+            cutoff = i + 1;
+            break;
+        }
+    }
+
+    for (int i = cutoff; i < size; i++) {
+        logits[pairs[i].second] = -INFINITY;
+    }
+}
+
+void InferenceEngine::apply_top_k(float* logits, int size, int k) {
+    if (k >= size) return;
+
+    std::vector<std::pair<float, int>> pairs;
+    for (int i = 0; i < size; i++) {
+        pairs.push_back({logits[i], i});
+    }
+
+    std::sort(pairs.begin(), pairs.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    for (int i = k; i < size; i++) {
+        logits[pairs[i].second] = -INFINITY;
+    }
+}
+
+void InferenceEngine::softmax(float* logits, int size) {
+    float max_val = logits[0];
+    for (int i = 1; i < size; i++) {
+        if (logits[i] > max_val) max_val = logits[i];
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        logits[i] = expf(logits[i] - max_val);
+        sum += logits[i];
+    }
+
+    for (int i = 0; i < size; i++) {
+        logits[i] /= sum;
+    }
+}
+
+int InferenceEngine::sample_greedy(const float* logits, int size) {
+    int best = 0;
+    float best_val = logits[0];
+    for (int i = 1; i < size; i++) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+int InferenceEngine::sample_multinomial(const float* logits, int size) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    float r = dist(gen);
+    float cumsum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        cumsum += logits[i];
+        if (r < cumsum) {
+            return i;
+        }
+    }
+    return size - 1;
+}
+
+void InferenceEngine::reset() {
+    if (kv_cache_) kv_cache_->clear();
+    if (paged_attention_) paged_attention_->clear();
+}
+
+size_t InferenceEngine::get_memory_usage() const {
+    size_t total = 0;
+    if (kv_cache_) total += kv_cache_->get_memory_usage();
+    return total;
+}
+
+} // namespace nova
